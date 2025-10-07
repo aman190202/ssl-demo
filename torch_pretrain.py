@@ -18,6 +18,12 @@ from timm.models.vision_transformer import Block
 from torch.utils.tensorboard import SummaryWriter
 
 
+try:
+    import wandb
+except Exception:
+    wandb = None
+
+
 device = "cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu")
 print("Device:", device)
 
@@ -29,8 +35,8 @@ def parse_args():
     parser.add_argument("--img_size", type=int, default=256)
     parser.add_argument("--patch_size", type=int, default=16)
     parser.add_argument("--val_split", type=float, default=0.1, help="val split fraction when dataset has no validation")
-    parser.add_argument("--num_workers", type=int, default=4)
-    parser.add_argument("--batch_size", type=int, default=24)
+    parser.add_argument("--num_workers", type=int, default=1)
+    parser.add_argument("--batch_size", type=int, default=96)
     parser.add_argument("--seed", type=int, default=42)
 
     # model
@@ -57,6 +63,13 @@ def parse_args():
     parser.add_argument("--save_every", type=int, default=5, help="save encoder every N epochs")
     parser.add_argument("--vis_every", type=int, default=10, help="log reconstruction panels every N epochs")
     parser.add_argument("--resume", type=str, default="", help="path to checkpoint to resume; if empty, auto-resume from run_dir/last.ckpt if present")
+
+    # wandb
+    parser.add_argument("--use_wandb", action="store_true", help="enable Weights & Biases logging")
+    parser.add_argument("--wandb_project", type=str, default="mae_galaxy10", help="W&B project")
+    parser.add_argument("--wandb_entity", type=str, default="", help="W&B entity (team or username)")
+    parser.add_argument("--wandb_run_name", type=str, default="", help="W&B run name (optional)")
+    parser.add_argument("--wandb_mode", type=str, default="online", choices=["online", "offline", "disabled"], help="W&B mode")
 
     args = parser.parse_args() if hasattr(__builtins__, "__IPYTHON__") is False else parser.parse_args("")
     return args
@@ -95,6 +108,14 @@ class Galaxy10(torch.utils.data.Dataset):
         return self.tf(img), y
 
 
+def safe_train_test_split(hf_ds, test_size, seed):
+    """Try stratified split on 'label'; fallback to random split if unsupported."""
+    try:
+        return hf_ds.train_test_split(test_size=test_size, seed=seed, stratify_by_column="label")
+    except Exception:
+        return hf_ds.train_test_split(test_size=test_size, seed=seed)
+
+
 def build_splits(dataset_dict):
     has_test = "test" in dataset_dict
     has_val = "validation" in dataset_dict
@@ -104,11 +125,11 @@ def build_splits(dataset_dict):
     hf_test = dataset_dict["test"] if has_test else None
 
     if hf_val is None:
-        split = hf_train.train_test_split(test_size=args.val_split, seed=args.seed, stratify_by_column="label")
+        split = safe_train_test_split(hf_train, test_size=args.val_split, seed=args.seed)
         hf_train, hf_val = split["train"], split["test"]
     if hf_test is None:
         # if no test, further split from train (small fraction)
-        split = hf_train.train_test_split(test_size=args.val_split, seed=args.seed, stratify_by_column="label")
+        split = safe_train_test_split(hf_train, test_size=args.val_split, seed=args.seed)
         hf_train, hf_test = split["train"], split["test"]
     return hf_train, hf_val, hf_test
 
@@ -306,6 +327,47 @@ def log_recon_samples(writer, model, imgs, global_step, n_show=8):
     writer.add_image("03_recon_full", grid_full, global_step)
 
 
+@torch.no_grad()
+def log_recon_samples_wandb(model, imgs, global_step, n_show=8):
+    if not (args.use_wandb and (wandb is not None)):
+        return
+    model.eval()
+    imgs = imgs[:n_show].to(device)
+    pred, patches, mask = model.forward_with_intermediates(imgs)
+
+    masked_patches = patches * (1 - mask.unsqueeze(-1))
+    masked_img = unpatchify(masked_patches)
+
+    recon_full = unpatchify(pred)
+    blended_patches = patches * (1 - mask.unsqueeze(-1)) + pred * mask.unsqueeze(-1)
+    recon_blended = unpatchify(blended_patches)
+
+    grid_input  = vutils.make_grid(denorm(imgs), nrow=min(4, n_show))
+    grid_masked = vutils.make_grid(denorm(masked_img), nrow=min(4, n_show))
+    grid_blend  = vutils.make_grid(denorm(recon_blended), nrow=min(4, n_show))
+    grid_full   = vutils.make_grid(denorm(recon_full), nrow=min(4, n_show))
+
+    wandb.log({
+        "images/00_input": wandb.Image(grid_input.cpu()),
+        "images/01_masked_input": wandb.Image(grid_masked.cpu()),
+        "images/02_recon_blended(masked_filled)": wandb.Image(grid_blend.cpu()),
+        "images/03_recon_full": wandb.Image(grid_full.cpu()),
+    }, step=global_step)
+
+    # sample-wise comparison table: original vs masked vs predicted
+    table = wandb.Table(columns=["original", "masked", "predicted"])
+    imgs_den = denorm(imgs).cpu()
+    masked_den = denorm(masked_img).cpu()
+    recon_den = denorm(recon_full).cpu()
+    for i in range(imgs.shape[0]):
+        table.add_data(
+            wandb.Image(imgs_den[i]),
+            wandb.Image(masked_den[i]),
+            wandb.Image(recon_den[i]),
+        )
+    wandb.log({"reconstruction_table": table}, step=global_step)
+
+
 # ============================================================
 # 6) kNN evaluation utilities
 # ============================================================
@@ -364,6 +426,28 @@ timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
 run_dir = args.run_dir
 os.makedirs(run_dir, exist_ok=True)
 writer = SummaryWriter(log_dir=run_dir)
+
+# Optional Weights & Biases init
+wandb_run = None
+if args.use_wandb:
+    if wandb is None:
+        print("Weights & Biases is not installed. Disabling --use_wandb.")
+        args.use_wandb = False
+    else:
+        run_name = args.wandb_run_name if args.wandb_run_name else f"mae_{timestamp}"
+        wandb_args = {
+            "project": args.wandb_project,
+            "name": run_name,
+            "config": vars(args),
+            "mode": args.wandb_mode,
+        }
+        if args.wandb_entity:
+            wandb_args["entity"] = args.wandb_entity
+        try:
+            wandb_run = wandb.init(**wandb_args)
+        except Exception as e:
+            print(f"Failed to initialize W&B: {e}. Disabling --use_wandb.")
+            args.use_wandb = False
 
 model = MAEViT(
     img_size=args.img_size,
@@ -435,15 +519,30 @@ try:
 
             epoch_loss += loss.item()
             writer.add_scalar("train/loss_step", loss.item(), global_step)
+            if args.use_wandb and (wandb is not None):
+                try:
+                    wandb.log({"train/loss_step": loss.item(), "global_step": global_step}, step=global_step)
+                except Exception:
+                    pass
             global_step += 1
 
         epoch_loss /= len(train_loader)
         writer.add_scalar("train/loss_epoch", epoch_loss, epoch)
+        if args.use_wandb and (wandb is not None):
+            try:
+                wandb.log({"train/loss_epoch": epoch_loss, "epoch": epoch}, step=global_step)
+            except Exception:
+                pass
 
         # Visualization panels
         if epoch % args.vis_every == 0:
             xb_vis, _ = next(iter(train_loader))
             log_recon_samples(writer, model, xb_vis, global_step, n_show=8)
+            if args.use_wandb and (wandb is not None):
+                try:
+                    log_recon_samples_wandb(model, xb_vis, global_step, n_show=8)
+                except Exception:
+                    pass
 
         # Eval kNN
         val_acc = float("nan")
@@ -459,6 +558,15 @@ try:
 
             writer.add_scalar("val/knn_top1", val_acc, epoch)
             writer.add_scalar("test/knn_top1", test_acc, epoch)
+            if args.use_wandb and (wandb is not None):
+                try:
+                    wandb.log({
+                        "val/knn_top1": val_acc,
+                        "test/knn_top1": test_acc,
+                        "epoch": epoch,
+                    }, step=global_step)
+                except Exception:
+                    pass
 
             # track best
             if val_acc > best_val:
@@ -493,6 +601,11 @@ except KeyboardInterrupt:
         "args": vars(args),
     }, os.path.join(run_dir, "interrupt.ckpt"))
     torch.save(model.encoder.state_dict(), os.path.join(run_dir, "encoder_latest.pth"))
+    if args.use_wandb and (wandb is not None):
+        try:
+            wandb.finish()
+        except Exception:
+            pass
     raise
 
 # Final saves
@@ -513,4 +626,9 @@ except Exception:
     pass
 
 writer.close()
+if args.use_wandb and (wandb is not None):
+    try:
+        wandb.finish()
+    except Exception:
+        pass
 print(f"TensorBoard logs saved to: {run_dir}")

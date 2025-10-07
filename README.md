@@ -2,7 +2,7 @@
 ## SLURM Setup (optional)
 ```bash
 interact -q gpu -f quadrortx -t 1:00:00 -m 16g
-module load cuda/11.8.0-lpttyok
+module load cuda/12.8.0-lpttyok
 module load cudnn/8.7.0.84-11.8-lg2dpd5
 module load miniconda3/23.11.0s
 
