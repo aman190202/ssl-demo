@@ -61,6 +61,22 @@ def parse_args():
     p.add_argument("--knn_t", type=float, default=0.07, help="temperature for kNN soft voting")
     p.add_argument("--eval_every", type=int, default=1)
 
+    # online probe (lightweight, updated during pretraining)
+    p.add_argument("--online_probe", action="store_true", help="enable online linear probe during pretraining")
+    p.add_argument("--online_probe_lr", type=float, default=0.1)
+    p.add_argument("--online_probe_weight_decay", type=float, default=1e-4)
+    p.add_argument("--online_probe_momentum", type=float, default=0.9)
+    p.add_argument("--online_probe_update_every", type=int, default=1, help="update online probe every N optimizer steps")
+
+    # offline probe (full training on cached features at checkpoints)
+    p.add_argument("--offline_probe", action="store_true", help="run offline linear probe at intervals using cached features")
+    p.add_argument("--offline_probe_every", type=int, default=10, help="run offline probe every N epochs")
+    p.add_argument("--offline_probe_epochs", type=int, default=200)
+    p.add_argument("--offline_probe_lr", type=float, default=1e-2)
+    p.add_argument("--offline_probe_weight_decay", type=float, default=1e-4)
+    p.add_argument("--offline_probe_batch_size", type=int, default=1024)
+    p.add_argument("--offline_probe_schedule", type=str, default="const", choices=["const"], help="LR schedule for offline probe")
+
     # io
     p.add_argument("--run_dir", type=str, default="runs/mae_galaxy10")
     p.add_argument("--save_every", type=int, default=5, help="save encoder every N epochs")
@@ -203,6 +219,118 @@ def random_masking(x, mask_ratio=MASK_RATIO):
     return x_kept, mask, ids_restore, ids_keep
 
 
+# import math
+
+# def random_masking(
+#     x: torch.Tensor,
+#     mask_ratio: float,
+#     *,
+#     scores: torch.Tensor | None = None,  # [B, N]
+#     h: int | None = None,
+#     w: int | None = None,
+#     block_frac: float = 0.4,
+#     bright_frac: float = 0.4,
+#     ratio_jitter: float = 0.0,           # IMPORTANT: keep 0.0 to ensure fixed N_keep across batch
+#     device: torch.device | None = None,
+# ):
+#     """
+#     Hybrid masking that guarantees a fixed N_keep for the entire batch.
+#     Returns: x_kept [B, N_keep, D], mask [B, N] (1=masked), ids_restore [B, N], ids_keep [B, N_keep]
+#     """
+#     B, N, D = x.shape
+#     device = device or x.device
+#     if h is None or w is None:
+#         g = int(math.isqrt(N))
+#         assert g * g == N, "Provide h,w for non-square layouts"
+#         h = w = g
+
+#     # ---- target counts (fixed across batch) ----
+#     N_mask_target = int(round(N * mask_ratio))
+#     N_mask_target = max(0, min(N, N_mask_target))
+#     N_keep = N - N_mask_target
+
+#     mask = torch.zeros(B, N, device=device, dtype=torch.bool)
+
+#     # ---- 1) blockwise masking ----
+#     if block_frac > 0 and N_mask_target > 0:
+#         block_budget = int(round(N_mask_target * block_frac))
+#         for b in range(B):
+#             remaining = block_budget
+#             attempts = 0
+#             while remaining > 0 and attempts < 8:
+#                 attempts += 1
+#                 area = max(1, min(remaining, int(0.3 * N)))
+#                 rh = max(1, int(torch.randint(1, min(h, int(math.sqrt(area))) + 1, (1,)).item()))
+#                 rw = max(1, min(w, area // rh if area // rh > 0 else 1))
+#                 r0 = int(torch.randint(0, max(1, h - rh + 1), (1,)).item())
+#                 c0 = int(torch.randint(0, max(1, w - rw + 1), (1,)).item())
+#                 # build rectangle boolean mask [N]
+#                 rows = torch.arange(h, device=device)
+#                 cols = torch.arange(w, device=device)
+#                 rect = ((rows[:, None] >= r0) & (rows[:, None] < r0 + rh) &
+#                         (cols[None, :] >= c0) & (cols[None, :] < c0 + rw)).flatten()
+#                 newly = (~mask[b]) & rect
+#                 add = int(newly.sum().item())
+#                 if add == 0:
+#                     continue
+#                 mask[b, newly] = True
+#                 remaining -= add
+
+#     # ---- 2) brightness / score-driven masking ----
+#     if scores is not None and bright_frac > 0 and N_mask_target > 0:
+#         assert scores.shape == (B, N)
+#         s = (scores - scores.mean(dim=1, keepdim=True)) / (scores.std(dim=1, keepdim=True) + 1e-6)
+#         # remaining budget after blocks (per image)
+#         remaining = (N_mask_target - mask.sum(dim=1)).clamp_min(0)
+#         take_bright = (remaining.float() * bright_frac).round().long()
+#         for b in range(B):
+#             k = int(min(take_bright[b].item(), (~mask[b]).sum().item()))
+#             if k <= 0:
+#                 continue
+#             idx_avail = torch.nonzero(~mask[b], as_tuple=False).squeeze(1)
+#             scores_avail = s[b, idx_avail]
+#             if idx_avail.numel() > 0:
+#                 topk = torch.topk(scores_avail, k=k, largest=True, sorted=False).indices
+#                 mask[b, idx_avail[topk]] = True
+
+#     # ---- 3) random fill or trim to meet EXACT N_mask_target ----
+#     for b in range(B):
+#         masked_now = int(mask[b].sum().item())
+#         if masked_now < N_mask_target:
+#             # add random masks from remaining
+#             need = N_mask_target - masked_now
+#             idx_avail = torch.nonzero(~mask[b], as_tuple=False).squeeze(1)
+#             choice = idx_avail[torch.randperm(idx_avail.numel(), device=device)[:need]]
+#             mask[b, choice] = True
+#         elif masked_now > N_mask_target:
+#             # unmask some randomly to reduce to target
+#             extra = masked_now - N_mask_target
+#             idx_masked = torch.nonzero(mask[b], as_tuple=False).squeeze(1)
+#             choice = idx_masked[torch.randperm(idx_masked.numel(), device=device)[:extra]]
+#             mask[b, choice] = False
+#         # now exactly N_mask_target masked → exactly N_keep kept
+
+#     # ---- build ids_keep / ids_restore (consistent sizes) ----
+#     keep = ~mask
+#     ids_keep = torch.zeros(B, N_keep, device=device, dtype=torch.long)
+#     ids_mask = torch.zeros(B, N_mask_target, device=device, dtype=torch.long)
+#     for b in range(B):
+#         idx_keep_b = torch.nonzero(keep[b], as_tuple=False).squeeze(1)
+#         # just in case: take first N_keep (order arbitrary)
+#         ids_keep[b] = idx_keep_b[:N_keep]
+#         idx_mask_b = torch.nonzero(mask[b], as_tuple=False).squeeze(1)
+#         ids_mask[b] = idx_mask_b[:N_mask_target]
+#     # permutation per image: [keep..., mask...]
+#     ids_shuffle = torch.cat([ids_keep, ids_mask], dim=1)                      # [B, N]
+#     # ids_restore maps from shuffled back to original positions
+#     ids_restore = torch.argsort(ids_shuffle, dim=1)
+
+#     # gather kept tokens into a fixed [B, N_keep, D]
+#     x_kept = torch.gather(x, 1, ids_keep.unsqueeze(-1).expand(-1, -1, D))
+
+#     return x_kept, mask.float(), ids_restore, ids_keep
+
+
 # ============================================================
 # 3.1. Fixed 2D sin-cos positional embeddings
 # ============================================================
@@ -266,6 +394,9 @@ class MAEViT(nn.Module):
         self.num_patches = (img_size // patch_size) ** 2
         self.in_dim = 3 * patch_size * patch_size
 
+        # Linear Patch Embedding for patchified tokens (used in encode)
+        self.patch_embed = nn.Linear(self.in_dim, emb_dim)
+
         # Conv-based Patch Embedding (as in MAE): kernel=stride=patch_size
         self.patch_embed_conv = nn.Conv2d(
             in_channels=3,
@@ -327,6 +458,30 @@ class MAEViT(nn.Module):
             x_kept = blk(x_kept)
         x_kept = self.enc_norm(x_kept)
         return x_kept, patches, mask, ids_restore
+    # def encode(self, imgs):
+    #     patches = patchify(imgs)                       # [B, N, 3*p*p]
+    #     x = self.patch_embed(patches)                  # [B, N, C]
+    #     # brightness (L1 over RGB patch), higher => more salient
+    #     with torch.no_grad():
+    #         bright = patches.abs().mean(dim=-1)        # [B, N]
+    #     h = w = self.img_size // self.patch_size
+
+    #     x_kept, mask, ids_restore, ids_keep = random_masking(
+    #         x, self.mask_ratio,
+    #         scores=bright, h=h, w=w,
+    #         block_frac=0.4, bright_frac=0.4, ratio_jitter=0.10
+    #     )
+    #     # positional embed only for kept tokens
+    #     pos_enc = torch.gather(
+    #         self.pos_embed_enc.expand(x.shape[0], -1, -1),
+    #         1,
+    #         ids_keep.unsqueeze(-1).expand(-1, -1, x.shape[-1])
+    #     )
+    #     x_kept = x_kept + pos_enc
+    #     for blk in self.encoder:
+    #         x_kept = blk(x_kept)
+    #     x_kept = self.enc_norm(x_kept)
+    #     return x_kept, patches, mask, ids_restore
 
     def decode(self, enc_tokens, ids_restore):
         B = enc_tokens.size(0)
@@ -476,6 +631,62 @@ def extract_features_for_loader(model: MAEViT, loader: torch.utils.data.DataLoad
     return feats, labels
 
 
+def infer_num_classes_from_loader(loader: torch.utils.data.DataLoader) -> int:
+    max_label = 0
+    for _, yb in loader:
+        max_label = max(max_label, int(yb.max().item()))
+    return max_label + 1
+
+
+@torch.no_grad()
+def evaluate_linear_probe_on_loader(probe: nn.Module,
+                                    model: MAEViT,
+                                    loader: torch.utils.data.DataLoader,
+                                    device: str) -> float:
+    probe.eval()
+    feats, labels = extract_features_for_loader(model, loader)
+    logits = probe(feats.to(device))
+    acc = (logits.argmax(1).cpu() == labels.cpu()).float().mean().item()
+    return acc
+
+
+def train_offline_probe_const_lr(train_feats: torch.Tensor,
+                                 train_labels: torch.Tensor,
+                                 val_feats: torch.Tensor,
+                                 val_labels: torch.Tensor,
+                                 emb_dim: int,
+                                 num_classes: int,
+                                 epochs: int,
+                                 lr: float,
+                                 weight_decay: float,
+                                 batch_size: int,
+                                 device: str) -> nn.Module:
+    probe = nn.Linear(emb_dim, num_classes).to(device)
+    # Apply weight decay to weights only
+    wd_params, nowd_params = [], []
+    for n, p in probe.named_parameters():
+        (wd_params if p.ndim > 1 else nowd_params).append(p)
+    opt = torch.optim.SGD(
+        [{"params": wd_params, "weight_decay": weight_decay},
+         {"params": nowd_params, "weight_decay": 0.0}],
+        lr=lr, momentum=0.9
+    )
+    ce = nn.CrossEntropyLoss()
+    ds = torch.utils.data.TensorDataset(train_feats, train_labels)
+    dl = torch.utils.data.DataLoader(ds, batch_size=batch_size, shuffle=True)
+    for _ in range(epochs):
+        probe.train()
+        for xb, yb in dl:
+            xb = xb.to(device, non_blocking=True)
+            yb = yb.to(device, non_blocking=True)
+            logits = probe(xb)
+            loss = ce(logits, yb)
+            opt.zero_grad(set_to_none=True)
+            loss.backward()
+            opt.step()
+    # Optionally evaluate on val inside caller
+    return probe
+
 @torch.no_grad()
 def knn_top1(train_feats, train_labels, query_feats, query_labels, k: int, T: float, num_classes: int):
     sims = query_feats @ train_feats.t()  # cosine similarity
@@ -616,7 +827,15 @@ else:
     print("Starting fresh training run.")
 
 metrics_csv = os.path.join(run_dir, "metrics.csv")
-metrics_header = ["epoch", "train_loss", "val_knn_top1", "test_knn_top1"]
+metrics_header = [
+    "epoch",
+    "train_loss",
+    "val_knn_top1",
+    "test_knn_top1",
+    "val_online_top1",
+    "val_offline_top1",
+    "test_offline_top1",
+]
 
 def save_checkpoint(epoch, is_best=False):
     state = {
@@ -717,6 +936,9 @@ try:
         # Eval kNN (use eval transforms for a *stable* train feature bank)
         val_acc = float("nan")
         test_acc = float("nan")
+        val_online_acc = float("nan")
+        val_offline_acc = float("nan")
+        test_offline_acc = float("nan")
         if epoch % args.eval_every == 0:
             train_feats, train_labels = extract_features_for_loader(model, train_loader_eval)
             num_classes = int(train_labels.max().item()) + 1
@@ -741,11 +963,56 @@ try:
                 save_checkpoint(epoch, is_best=True)
                 save_encoder_bundle(epoch, tag=f"epoch_{epoch:03d}_best")
 
+        # Offline probe (train on cached features) at specified cadence
+        if args.offline_probe and (epoch % args.offline_probe_every == 0):
+            # Ensure we have features; recompute if not computed this epoch
+            tr_feats, tr_labels = extract_features_for_loader(model, train_loader_eval)
+            va_feats, va_labels = extract_features_for_loader(model, val_loader)
+            te_feats, te_labels = extract_features_for_loader(model, test_loader)
+            emb_dim = tr_feats.shape[1]
+            num_classes_off = int(max(tr_labels.max().item(), va_labels.max().item(), te_labels.max().item())) + 1
+
+            probe = train_offline_probe_const_lr(
+                train_feats=tr_feats.cpu(),
+                train_labels=tr_labels.cpu(),
+                val_feats=va_feats.cpu(),
+                val_labels=va_labels.cpu(),
+                emb_dim=emb_dim,
+                num_classes=num_classes_off,
+                epochs=args.offline_probe_epochs,
+                lr=args.offline_probe_lr,
+                weight_decay=args.offline_probe_weight_decay,
+                batch_size=args.offline_probe_batch_size,
+                device=device,
+            )
+
+            with torch.no_grad():
+                probe.eval()
+                v_logits = probe(va_feats.to(device))
+                t_logits = probe(te_feats.to(device))
+                val_offline_acc = (v_logits.argmax(1).cpu() == va_labels.cpu()).float().mean().item()
+                test_offline_acc = (t_logits.argmax(1).cpu() == te_labels.cpu()).float().mean().item()
+
+            writer.add_scalar("val/offline_top1", val_offline_acc, epoch)
+            writer.add_scalar("test/offline_top1", test_offline_acc, epoch)
+            if args.use_wandb and (wandb is not None):
+                try:
+                    wandb.log({
+                        "val/offline_top1": val_offline_acc,
+                        "test/offline_top1": test_offline_acc,
+                        "epoch": epoch
+                    }, step=global_step)
+                except Exception:
+                    pass
+
         append_metrics_csv(metrics_csv, {
             "epoch": epoch,
             "train_loss": epoch_loss,
             "val_knn_top1": val_acc,
             "test_knn_top1": test_acc,
+            "val_online_top1": val_online_acc,
+            "val_offline_top1": val_offline_acc,
+            "test_offline_top1": test_offline_acc,
         }, metrics_header)
 
         # Save checkpoints

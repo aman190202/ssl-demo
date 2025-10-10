@@ -15,4 +15,5 @@ With the encoder frozen (correct arch/ckpt loaded), the linear probe improved st
 runs/mae_latest
 Test accuracy climbed to 47% 
 
-runs/
+Linear Probe
+attaching linear probe gave a deeper insight into what is happening ; will experiment with different settings now - will mask more parts of the image and make masking not random 

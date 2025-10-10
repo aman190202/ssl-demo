@@ -35,25 +35,30 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 # Run MAE pretraining
 # -----------------------------
 
-echo "Latest_with_probe_inserted"
+# echo "Latest_with_probe_inserted"
+# echo "Latest_with_probe_inserted w random masking"
 python torch_pretrain.py \
   --dataset matthieulel/galaxy10_decals \
-  --run_dir runs/mae_mask60 \
+  --run_dir runs/mae_fast_reliable_192d8_random_masking_75 \
   --img_size 256 --patch_size 16 \
-  --batch_size 96 \
-  --epochs 400 --warmup_epochs 40 \
-  --lr 1.5e-4 --weight_decay 0.05 --lr_schedule cosine \
-  --mask_ratio 0.60 \
-  --emb_dim 512 --enc_depth 16 --enc_heads 8 \
-  --dec_dim 512 --dec_depth 8 \
-  --knn_k 20 --knn_t 0.07 \
-  --save_every 10 --use_wandb --wandb_project mae_galaxy10 \
-  --wandb_run_name mae_mask60_512_16_512_16
+  --num_workers 4 \
+  --batch_size 64 --accum_steps 1 \
+  --epochs 120 --warmup_epochs 10 \
+  --lr_schedule cosine --lr 4e-4 --weight_decay 0.05 \
+  --mask_ratio 0.70 \
+  --emb_dim 192 --enc_depth 8 --enc_heads 3 \
+  --dec_dim 192 --dec_depth 2 \
+  --knn_k 20 --knn_t 0.07 --eval_every 1 \
+  --save_every 10 --vis_every 10 \
+  --use_wandb --wandb_project mae_galaxy10 \
+  --wandb_run_name mae_fast_reliable_192d8_random_masking_75
 
 
-
-# python probe_galaxy.py \
-#   --ckpt_path runs/mae_galaxy10_fix/encoder_epoch_015.pth \
-#   --respect_ckpt_meta \
-#   --schedule onecycle --probe_batch_size 96 --max_lr 0.05 --nesterov \
-#   --probe_epochs 1000 --num_workers 1 --emb_dim 384 --enc_depth 12 --enc_heads 6
+# python linear_probe.py \
+#   --encoder_path runs/mae_fast_reliable_192d8_random_masking/encoder_epoch_004_best.pth \
+#   --save_dir runs/linear_probe_fix \
+#   --dataset matthieulel/galaxy10_decals \
+#   --img_size 256 --patch_size 16 \
+#   --batch_size 256 --num_workers 2 \
+#   --probe_mode lbfgs --lbfgs_max_iter 120 \
+#   --l2norm --epochs 500
