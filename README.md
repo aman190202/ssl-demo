@@ -10,19 +10,33 @@ source /oscar/runtime/software/external/miniconda3/23.11.0/etc/profile.d/conda.s
 
 conda create -n ssl python=3.11
 conda activate ssl
+pip install -r requirements.txt
 ```
-## Stable Pretraining Setup
+
+## Sample runs
 ```bash
-git clone https://github.com/rbalestr-lab/stable-pretraining.git
-```
-Follow instructions at [https://github.com/rbalestr-lab/stable-pretraining](https://github.com/rbalestr-lab/stable-pretraining)
+python torch_pretrain.py \
+  --dataset matthieulel/galaxy10_decals \
+  --run_dir runs/mae_vits16_384d12_m0p70_e200 \
+  --img_size 256 --patch_size 16 \
+  --num_workers 4 \
+  --batch_size 64 --accum_steps 1 \
+  --epochs 200 --warmup_epochs 10 \
+  --lr_schedule cosine --lr 4e-4 --weight_decay 0.05 \
+  --mask_ratio 0.70 \
+  --emb_dim 384 --enc_depth 12 --enc_heads 6 \
+  --dec_dim 384 --dec_depth 4 \
+  --knn_k 20 --knn_t 0.07 --eval_every 1 \
+  --save_every 10 --vis_every 10 \
+  --use_wandb --wandb_project mae_galaxy10 \
+  --wandb_run_name mae_vits16_384d12_m0p70_e200
 
-## PyTorch runs
-
-```bash
-# fresh
-python torch_pretrain.py --run_dir runs/mae_galaxy10 --epochs 100 --save_every 5
-
-# resume
-python torch_pretrain.py --run_dir runs/mae_galaxy10 --resume runs/mae_galaxy10/last.ckpt
+python linear_probe.py \
+  --encoder_path runs/mae_fast_reliable_192d8_random_masking/encoder_epoch_004_best.pth \
+  --save_dir runs/linear_probe_fix \
+  --dataset matthieulel/galaxy10_decals \
+  --img_size 256 --patch_size 16 \
+  --batch_size 256 --num_workers 2 \
+  --probe_mode lbfgs --lbfgs_max_iter 120 \
+  --l2norm --epochs 500
 ```

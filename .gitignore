@@ -5,3 +5,7 @@
 /wandb
 /logs
 .cache/
+/analysis_plots
+correct_netrics.py
+plot_runs.py
+torch_pretrain_hybrid.py

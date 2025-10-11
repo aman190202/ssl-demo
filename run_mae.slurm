@@ -35,30 +35,34 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 # Run MAE pretraining
 # -----------------------------
 
-# echo "Latest_with_probe_inserted"
-# echo "Latest_with_probe_inserted w random masking"
+
 python torch_pretrain.py \
   --dataset matthieulel/galaxy10_decals \
-  --run_dir runs/mae_fast_reliable_192d8_random_masking_75 \
+  --run_dir runs/mae_vits16_384d12_m0p70_e200 \
   --img_size 256 --patch_size 16 \
   --num_workers 4 \
   --batch_size 64 --accum_steps 1 \
-  --epochs 120 --warmup_epochs 10 \
+  --epochs 200 --warmup_epochs 10 \
   --lr_schedule cosine --lr 4e-4 --weight_decay 0.05 \
   --mask_ratio 0.70 \
-  --emb_dim 192 --enc_depth 8 --enc_heads 3 \
-  --dec_dim 192 --dec_depth 2 \
+  --emb_dim 384 --enc_depth 12 --enc_heads 6 \
+  --dec_dim 384 --dec_depth 4 \
   --knn_k 20 --knn_t 0.07 --eval_every 1 \
   --save_every 10 --vis_every 10 \
   --use_wandb --wandb_project mae_galaxy10 \
-  --wandb_run_name mae_fast_reliable_192d8_random_masking_75
+  --wandb_run_name mae_vits16_384d12_m0p70_e200
+
+python linear_probe.py \
+  --encoder_path runs/mae_fast_reliable_192d8_random_masking/encoder_epoch_004_best.pth \
+  --save_dir runs/linear_probe_fix \
+  --dataset matthieulel/galaxy10_decals \
+  --img_size 256 --patch_size 16 \
+  --batch_size 256 --num_workers 2 \
+  --probe_mode lbfgs --lbfgs_max_iter 120 \
+  --l2norm --epochs 500
+
+pip install matplotlib
+
+python collect_metrics.py --roots runs --overlay-val
 
 
-# python linear_probe.py \
-#   --encoder_path runs/mae_fast_reliable_192d8_random_masking/encoder_epoch_004_best.pth \
-#   --save_dir runs/linear_probe_fix \
-#   --dataset matthieulel/galaxy10_decals \
-#   --img_size 256 --patch_size 16 \
-#   --batch_size 256 --num_workers 2 \
-#   --probe_mode lbfgs --lbfgs_max_iter 120 \
-#   --l2norm --epochs 500
